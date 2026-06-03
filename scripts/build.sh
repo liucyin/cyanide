@@ -5,7 +5,8 @@
 #
 # Run as: ./scripts/build.sh
 # Override defaults with env vars:
-#   SCHEME, CONFIG (Debug|Release), SDK (iphoneos|iphonesimulator)
+#   SCHEME, CONFIG (Debug|Release), SDK (iphoneos|iphonesimulator),
+#   XCODEBUILD_DESTINATION (defaults to generic/platform=iOS for iphoneos)
 #
 # The version comes from CFBundleShortVersionString in the built Info.plist
 # (= the MARKETING_VERSION build setting in the xcodeproj). Bump
@@ -21,6 +22,7 @@ cd "$(dirname "$0")/.."
 SCHEME="${SCHEME:-Cyanide}"
 CONFIG="${CONFIG:-Debug}"
 SDK="${SDK:-iphoneos}"
+XCODEBUILD_DESTINATION="${XCODEBUILD_DESTINATION:-}"
 PROJECT="Cyanide.xcodeproj"
 DERIVED="$PWD/build/DerivedData"
 PRODUCT_DIR="$DERIVED/Build/Products/${CONFIG}-${SDK}"
@@ -29,22 +31,28 @@ IPA_LATEST="$PWD/build/Cyanide.ipa"
 
 mkdir -p build
 
+XCODEBUILD_ARGS=(
+    -project "$PROJECT"
+    -scheme "$SCHEME"
+    -sdk "$SDK"
+    -configuration "$CONFIG"
+    -derivedDataPath "$DERIVED"
+)
+
+if [ -z "$XCODEBUILD_DESTINATION" ] && [[ "$SDK" == iphoneos* ]]; then
+    XCODEBUILD_DESTINATION="generic/platform=iOS"
+fi
+
+if [ -n "$XCODEBUILD_DESTINATION" ]; then
+    XCODEBUILD_ARGS+=( -destination "$XCODEBUILD_DESTINATION" )
+fi
+
 echo "==> xcodebuild ($SCHEME / $CONFIG / $SDK)"
-xcodebuild \
-    -project "$PROJECT" \
-    -scheme "$SCHEME" \
-    -sdk "$SDK" \
-    -configuration "$CONFIG" \
-    -derivedDataPath "$DERIVED" \
+xcodebuild "${XCODEBUILD_ARGS[@]}" \
     CODE_SIGNING_ALLOWED=NO \
     build \
     | xcbeautify --quiet 2>/dev/null \
-    || xcodebuild \
-         -project "$PROJECT" \
-         -scheme "$SCHEME" \
-         -sdk "$SDK" \
-         -configuration "$CONFIG" \
-         -derivedDataPath "$DERIVED" \
+    || xcodebuild "${XCODEBUILD_ARGS[@]}" \
          CODE_SIGNING_ALLOWED=NO \
          build
 

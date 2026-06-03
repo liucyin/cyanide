@@ -1,0 +1,47 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CYANIDE_SUBMODULE_TOKEN || github.token }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install ldid xcbeautify
+
+      - name: Build unsigned IPA
+        env:
+          CONFIG: Debug
+          SDK: iphoneos
+          XCODEBUILD_DESTINATION: generic/platform=iOS
+        run: ./scripts/build.sh
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cyanide-unsigned-ipa
+          path: |
+            build/Cyanide.ipa
+            build/Cyanide-*.ipa
+          if-no-files-found: error
+          retention-days: 14
