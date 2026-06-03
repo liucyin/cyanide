@@ -172,6 +172,7 @@ static int gAxonListCacheLogBudget = 8;
 static int gAxonListViewLogBudget = 16;
 static int gAxonListCacheEntryLogBudget = 4;
 static int gAxonRequestCacheLogBudget = 16;
+static int gAxonControllerShapeLogBudget = 18;
 static bool gAxonLegacyWindowCleaned = false;
 
 typedef enum {
@@ -365,6 +366,41 @@ static bool axn_object_looks_like_request(uint64_t obj)
     return hasIdentifier && hasPayload;
 }
 
+static void axn_log_controller_shape(const char *label, uint64_t vc)
+{
+    if (gAxonControllerShapeLogBudget <= 0 || !r_is_objc_ptr(vc)) return;
+
+    char cls[128];
+    if (!axn_object_class_name(vc, cls, sizeof(cls))) snprintf(cls, sizeof(cls), "?");
+
+    bool allReq = axn_responds_sel_main(vc, AXNSelAllNotificationRequests,
+                                        "allNotificationRequests");
+    bool allReqIvar = r_is_objc_ptr(r_ivar_value(vc, "_allNotificationRequests"));
+    bool listModelSel = r_responds_main(vc, "listModel");
+    bool listModelIvar = r_is_objc_ptr(axn_ivar_value_cached(vc, AXNIvarListModel,
+                                                            "_listModel"));
+    bool listView = r_responds_main(vc, "listView");
+    bool remove = axn_responds_sel_main(vc, AXNSelRemoveNotificationRequest,
+                                        "removeNotificationRequest:");
+    bool removeCoalesced = axn_responds_sel_main(vc, AXNSelRemoveNotificationRequestCoalesced,
+                                                 "removeNotificationRequest:forCoalescedNotification:");
+    bool toggle = r_responds_main(vc, "toggleFilteringForSectionIdentifier:shouldFilter:");
+
+    printf("[AXONLITE] controller shape %s=0x%llx class=%s allReq=%d/%d listModel=%d/%d listView=%d remove=%d/%d toggle=%d\n",
+           label ? label : "vc",
+           (unsigned long long)vc,
+           cls,
+           allReq,
+           allReqIvar,
+           listModelSel,
+           listModelIvar,
+           listView,
+           remove,
+           removeCoalesced,
+           toggle);
+    gAxonControllerShapeLogBudget--;
+}
+
 static void axn_log_object_shape(const char *label, uint64_t obj)
 {
     if (!label) return;
@@ -509,22 +545,54 @@ static bool axn_vc_looks_like_notification_list(uint64_t vc)
 {
     if (!r_is_objc_ptr(vc)) return false;
 
-    if (!axn_responds_sel_main(vc, AXNSelAllNotificationRequests, "allNotificationRequests")) {
-        return false;
-    }
+    char cls[128];
+    bool haveClass = axn_object_class_name(vc, cls, sizeof(cls));
+    if (!haveClass) snprintf(cls, sizeof(cls), "?");
 
-    if (axn_is_kind_of_named_class(vc, "NCNotificationStructuredListViewController") ||
-        axn_is_kind_of_named_class(vc, "NCNotificationCombinedListViewController")) {
+    bool classLooks = axn_is_kind_of_named_class(vc, "NCNotificationStructuredListViewController") ||
+                      axn_is_kind_of_named_class(vc, "NCNotificationCombinedListViewController") ||
+                      strstr(cls, "NCNotification") != NULL ||
+                      strstr(cls, "NotificationList") != NULL ||
+                      strstr(cls, "StructuredList") != NULL ||
+                      (strstr(cls, "Notification") != NULL && strstr(cls, "ViewController") != NULL);
+
+    bool allRequests = axn_responds_sel_main(vc, AXNSelAllNotificationRequests,
+                                             "allNotificationRequests") ||
+                       r_is_objc_ptr(r_ivar_value(vc, "_allNotificationRequests"));
+    bool listModel = r_responds_main(vc, "listModel") ||
+                     r_is_objc_ptr(axn_ivar_value_cached(vc, AXNIvarListModel,
+                                                         "_listModel"));
+    bool listView = r_responds_main(vc, "listView");
+    bool mutatesRequests = axn_responds_sel_main(vc, AXNSelRemoveNotificationRequestCoalesced,
+                                                 "removeNotificationRequest:forCoalescedNotification:") ||
+                           axn_responds_sel_main(vc, AXNSelRemoveNotificationRequest,
+                                                 "removeNotificationRequest:") ||
+                           r_responds_main(vc, "toggleFilteringForSectionIdentifier:shouldFilter:");
+
+    if (allRequests && (classLooks || mutatesRequests || listView)) {
         return true;
     }
 
-    return axn_responds_sel_main(vc, AXNSelRemoveNotificationRequestCoalesced, "removeNotificationRequest:forCoalescedNotification:") ||
-           axn_responds_sel_main(vc, AXNSelRemoveNotificationRequest, "removeNotificationRequest:");
+    // iOS 17.5.x on some devices materializes the controller without exposing
+    // -allNotificationRequests. The request source then lives behind listModel,
+    // while the controller still has the NCNotification class shape.
+    return classLooks && (listModel || (listView && mutatesRequests));
 }
 
 static uint64_t axn_accept_list_controller(uint64_t vc, const char *via)
 {
-    if (!axn_vc_looks_like_notification_list(vc)) return 0;
+    if (!axn_vc_looks_like_notification_list(vc)) {
+        if (r_is_objc_ptr(vc)) {
+            char cls[128];
+            if (!axn_object_class_name(vc, cls, sizeof(cls))) snprintf(cls, sizeof(cls), "?");
+            if (strstr(cls, "NCNotification") || strstr(cls, "CSCombined") ||
+                strstr(cls, "StructuredList") || strstr(cls, "NotificationList")) {
+                axn_log_controller_shape(via, vc);
+            }
+        }
+        return 0;
+    }
+    axn_log_controller_shape(via, vc);
     printf("[AXONLITE] list controller=0x%llx via %s\n", vc, via ? via : "?");
     return vc;
 }
@@ -856,6 +924,8 @@ static uint64_t axn_force_chain_construction(void)
         r_msg2_main(clvc, "loadViewIfNeeded", 0, 0, 0, 0);
 
         gAxonCombined = combined;
+        gAxonCoverSheetWindow = win;
+        axn_log_controller_shape("warmup.notificationListViewController", clvc);
         printf("[AXONLITE] warmup: clvc=0x%llx materialized via cover-sheet chain (no lockscreen needed)\n",
                (unsigned long long)clvc);
         return clvc;
@@ -871,8 +941,7 @@ static uint64_t axn_force_chain_construction(void)
 
 static uint64_t axn_find_notification_list_controller(void)
 {
-    if (r_is_objc_ptr(gAxonCLVC) &&
-        axn_responds_sel_main(gAxonCLVC, AXNSelAllNotificationRequests, "allNotificationRequests")) {
+    if (axn_vc_looks_like_notification_list(gAxonCLVC)) {
         return gAxonCLVC;
     }
     gAxonCLVC = 0;
@@ -3295,6 +3364,7 @@ bool axonlite_stop_in_session(void)
     gAxonSegmentSignature[0] = '\0';
     gAxonBadgeSignature[0] = '\0';
     gAxonLoggedControllerMiss = false;
+    gAxonControllerShapeLogBudget = 18;
     printf("[AXONLITE] stopped clvc=0x%llx restored=%d skipped=%d\n",
            clvc, restored, restoreSkipped);
     r_settle_us(oldSettleUS);
@@ -3398,6 +3468,7 @@ void axonlite_forget_remote_state(void)
     gAxonCSMainPageClassTried = false;
     gAxonBadgedIconViewClassTried = false;
     gAxonWarmupLogBudget = 24;
+    gAxonControllerShapeLogBudget = 18;
     gAxonTick = 0;
 
     printf("[AXONLITE] forgot remote overlay/filter state\n");
