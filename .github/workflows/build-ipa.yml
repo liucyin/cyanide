@@ -15,9 +15,118 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.CYANIDE_SUBMODULE_TOKEN || github.token }}
-          submodules: recursive
           fetch-depth: 1
+
+      - name: Create CI stubs for private tweaks
+        run: |
+          mkdir -p Cyanide/tweaks/private
+          cat > Cyanide/tweaks/private/rssidisplay.h <<'EOF'
+          #ifndef rssidisplay_h
+          #define rssidisplay_h
+          #include <stdbool.h>
+          bool rssidisplay_apply_in_session(bool showWifi, bool showCellular);
+          bool rssidisplay_stop_in_session(void);
+          void rssidisplay_forget_remote_state(void);
+          #endif
+          EOF
+          cat > Cyanide/tweaks/private/rssidisplay.m <<'EOF'
+          #import "rssidisplay.h"
+          bool rssidisplay_apply_in_session(bool showWifi, bool showCellular) { (void)showWifi; (void)showCellular; return false; }
+          bool rssidisplay_stop_in_session(void) { return true; }
+          void rssidisplay_forget_remote_state(void) {}
+          EOF
+          cat > Cyanide/tweaks/private/typebanner.h <<'EOF'
+          #ifndef typebanner_h
+          #define typebanner_h
+          #include <stdbool.h>
+          #ifdef __OBJC__
+          @class NSString;
+          @class RemoteCallSession;
+          #endif
+          #define TYPEBANNER_RC_FIRST_EXCEPTION_TIMEOUT_MS 1000
+          #define TYPEBANNER_RC_MOBILESMS_FIRST_EXCEPTION_TIMEOUT_MS 1000
+          bool typebanner_prepare_in_springboard_session(void);
+          bool typebanner_release_mobilesms_keepalive_in_springboard_session(void);
+          bool typebanner_hide_in_springboard_session(void);
+          bool typebanner_release_mobilesms_keepalive_in_springboard_remote_session(RemoteCallSession *session);
+          bool typebanner_hide_in_springboard_remote_session(RemoteCallSession *session);
+          bool typebanner_show_in_springboard_remote_session(RemoteCallSession *session, NSString *label);
+          NSString *typebanner_poll_in_imagent_remote_session(RemoteCallSession *session);
+          bool typebanner_run_once_with_mobile_session_and_current_springboard(RemoteCallSession **mobileSession, bool springboardReady);
+          bool typebanner_has_remote_state(void);
+          void typebanner_forget_remote_state(void);
+          #endif
+          EOF
+          cat > Cyanide/tweaks/private/typebanner.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import "typebanner.h"
+          bool typebanner_prepare_in_springboard_session(void) { return false; }
+          bool typebanner_release_mobilesms_keepalive_in_springboard_session(void) { return true; }
+          bool typebanner_hide_in_springboard_session(void) { return true; }
+          bool typebanner_release_mobilesms_keepalive_in_springboard_remote_session(RemoteCallSession *session) { (void)session; return true; }
+          bool typebanner_hide_in_springboard_remote_session(RemoteCallSession *session) { (void)session; return true; }
+          bool typebanner_show_in_springboard_remote_session(RemoteCallSession *session, NSString *label) { (void)session; (void)label; return false; }
+          NSString *typebanner_poll_in_imagent_remote_session(RemoteCallSession *session) { (void)session; return nil; }
+          bool typebanner_run_once_with_mobile_session_and_current_springboard(RemoteCallSession **mobileSession, bool springboardReady) { (void)mobileSession; (void)springboardReady; return true; }
+          bool typebanner_has_remote_state(void) { return false; }
+          void typebanner_forget_remote_state(void) {}
+          EOF
+          cat > Cyanide/tweaks/private/call_recording_sound.h <<'EOF'
+          #ifndef call_recording_sound_h
+          #define call_recording_sound_h
+          #include <stdbool.h>
+          bool call_recording_sound_set_disabled(bool disabled);
+          #endif
+          EOF
+          cat > Cyanide/tweaks/private/call_recording_sound.m <<'EOF'
+          #import "call_recording_sound.h"
+          bool call_recording_sound_set_disabled(bool disabled) { (void)disabled; return false; }
+          EOF
+          cat > Cyanide/tweaks/private/stagestrip.h <<'EOF'
+          #ifndef stagestrip_h
+          #define stagestrip_h
+          #include <stdbool.h>
+          bool stagestrip_apply_in_session(int maxApps);
+          bool stagestrip_stop_in_session(void);
+          void stagestrip_start_control_loop(void);
+          void stagestrip_stop_control_loop(void);
+          void stagestrip_forget_remote_state(void);
+          #endif
+          EOF
+          cat > Cyanide/tweaks/private/stagestrip.m <<'EOF'
+          #import "stagestrip.h"
+          bool stagestrip_apply_in_session(int maxApps) { (void)maxApps; return false; }
+          bool stagestrip_stop_in_session(void) { return true; }
+          void stagestrip_start_control_loop(void) {}
+          void stagestrip_stop_control_loop(void) {}
+          void stagestrip_forget_remote_state(void) {}
+          EOF
+          cat > Cyanide/tweaks/private/location_sim.h <<'EOF'
+          #ifndef location_sim_h
+          #define location_sim_h
+          #include <stdbool.h>
+          typedef struct {
+              double latitude;
+              double longitude;
+              double altitude;
+              double horizontalAccuracy;
+              double verticalAccuracy;
+              const char *hostProcess;
+              bool launchHost;
+          } LocationSimConfig;
+          bool locationsim_apply_static(const LocationSimConfig *config);
+          bool locationsim_stop(const char *hostProcess, bool launchHost);
+          bool locationsim_apply_strict_hosts(const LocationSimConfig *config);
+          bool locationsim_stop_strict_hosts(const char *hostProcess, bool launchHost);
+          #endif
+          EOF
+          cat > Cyanide/tweaks/private/location_sim.m <<'EOF'
+          #import "location_sim.h"
+          bool locationsim_apply_static(const LocationSimConfig *config) { (void)config; return false; }
+          bool locationsim_stop(const char *hostProcess, bool launchHost) { (void)hostProcess; (void)launchHost; return true; }
+          bool locationsim_apply_strict_hosts(const LocationSimConfig *config) { (void)config; return false; }
+          bool locationsim_stop_strict_hosts(const char *hostProcess, bool launchHost) { (void)hostProcess; (void)launchHost; return true; }
+          EOF
 
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
