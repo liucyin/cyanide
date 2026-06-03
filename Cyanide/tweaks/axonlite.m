@@ -120,6 +120,9 @@ static const int kAxonScanChildLimit = 4;
 static const int kAxonScanWindowLimit = 10;
 static const int kAxonCacheDepthLimit = 7;
 static const int kAxonRootItemLimit = 48;
+static const int kAxonFallbackViewDepthLimit = 7;
+static const int kAxonFallbackSubviewLimit = 32;
+static const int kAxonFallbackNodeLimit = 220;
 static const uint32_t kAxonRemoteSettleUS = 5000;
 
 static AXNRequestEntry gAxonRequests[kAxonMaxRequests];
@@ -173,6 +176,8 @@ static int gAxonListViewLogBudget = 16;
 static int gAxonListCacheEntryLogBudget = 4;
 static int gAxonRequestCacheLogBudget = 16;
 static int gAxonControllerShapeLogBudget = 18;
+static int gAxonFallbackRootLogBudget = 18;
+static int gAxonFallbackViewLogBudget = 36;
 static bool gAxonLegacyWindowCleaned = false;
 
 typedef enum {
@@ -1290,6 +1295,63 @@ static void axn_cache_collection(uint64_t collection, uint64_t tick, int depth, 
 static bool axn_cache_indexed_components(uint64_t collection, const char *selName,
                                          const char *label, uint64_t tick,
                                          int depth, int *remaining);
+static bool axn_cache_view_tree(uint64_t view, uint64_t tick, int depth,
+                                int *remaining, int *nodeBudget);
+
+static bool axn_class_interesting_for_request_owner(const char *cls)
+{
+    if (!cls || !cls[0]) return false;
+    return strstr(cls, "NCNotification") ||
+           strstr(cls, "Notification") ||
+           strstr(cls, "Bulletin") ||
+           strstr(cls, "Platter") ||
+           strstr(cls, "ListCell") ||
+           strstr(cls, "ContentViewController") ||
+           strstr(cls, "CombinedList") ||
+           strstr(cls, "StructuredList") ||
+           strstr(cls, "CoverSheet");
+}
+
+static bool axn_view_is_axon_overlay(uint64_t view)
+{
+    if (!r_is_objc_ptr(view) || !r_responds_main(view, "tag")) return false;
+    uint64_t tag = r_msg2_main(view, "tag", 0, 0, 0, 0);
+    return tag == kAxonOverlayContainerTag ||
+           tag == kAxonOverlayTag ||
+           tag == kAxonOverlayBadgeTag;
+}
+
+static bool axn_cache_candidate_request(uint64_t owner, uint64_t candidate,
+                                        const char *label, uint64_t tick,
+                                        int depth, int *remaining)
+{
+    if (!r_is_objc_ptr(candidate) || candidate == owner || !remaining || *remaining <= 0) {
+        return false;
+    }
+
+    int before = *remaining;
+    if (axn_object_looks_like_request(candidate) &&
+        axn_cache_request_object_fast(candidate, owner, tick)) {
+        (*remaining)--;
+        if (gAxonFallbackViewLogBudget > 0) {
+            char ownerCls[96];
+            char reqCls[96];
+            if (!axn_object_class_name(owner, ownerCls, sizeof(ownerCls))) snprintf(ownerCls, sizeof(ownerCls), "?");
+            if (!axn_object_class_name(candidate, reqCls, sizeof(reqCls))) snprintf(reqCls, sizeof(reqCls), "?");
+            printf("[AXONLITE] fallback request owner=0x%llx class=%s via=%s req=0x%llx class=%s\n",
+                   (unsigned long long)owner,
+                   ownerCls,
+                   label ? label : "?",
+                   (unsigned long long)candidate,
+                   reqCls);
+            gAxonFallbackViewLogBudget--;
+        }
+        return true;
+    }
+
+    axn_cache_collection(candidate, tick, depth + 1, remaining);
+    return *remaining < before;
+}
 
 static bool axn_cache_request_from_view_or_controller(uint64_t obj, uint64_t tick,
                                                       int depth, int *remaining)
@@ -1305,36 +1367,133 @@ static bool axn_cache_request_from_view_or_controller(uint64_t obj, uint64_t tic
         return true;
     }
 
-    uint64_t req = axn_try_msg0_main(obj, "notificationRequest");
-    if (!r_is_objc_ptr(req)) req = r_ivar_value(obj, "_notificationRequest");
-    if (r_is_objc_ptr(req) && req != obj) {
-        axn_cache_collection(req, tick, depth + 1, remaining);
-        if (*remaining < before) return true;
+    char cls[128] = "";
+    bool haveClass = axn_object_class_name(obj, cls, sizeof(cls));
+    bool broadScan = haveClass && axn_class_interesting_for_request_owner(cls);
+
+    static const char *requestSelectorsAlways[] = {
+        "notificationRequest",
+        "leadingNotificationRequest",
+        "representedNotificationRequest",
+    };
+    static const char *requestSelectorsBroad[] = {
+        "request",
+        "representedObject",
+        "notification",
+        "bulletin",
+        "content",
+        "item",
+        "object",
+    };
+    static const char *requestIvarsAlways[] = {
+        "_notificationRequest",
+        "_leadingNotificationRequest",
+        "_representedNotificationRequest",
+    };
+    static const char *requestIvarsBroad[] = {
+        "_request",
+        "_representedObject",
+        "_notification",
+        "_bulletin",
+        "_content",
+        "_item",
+        "_object",
+        "_primaryRequest",
+        "_threadedNotificationRequest",
+    };
+
+    for (size_t i = 0; i < sizeof(requestSelectorsAlways) / sizeof(requestSelectorsAlways[0]); i++) {
+        if (*remaining <= 0) return *remaining < before;
+        uint64_t req = axn_try_msg0_main(obj, requestSelectorsAlways[i]);
+        if (axn_cache_candidate_request(obj, req, requestSelectorsAlways[i], tick, depth, remaining)) {
+            return true;
+        }
+    }
+    if (broadScan) {
+        for (size_t i = 0; i < sizeof(requestSelectorsBroad) / sizeof(requestSelectorsBroad[0]); i++) {
+            if (*remaining <= 0) return *remaining < before;
+            uint64_t req = axn_try_msg0_main(obj, requestSelectorsBroad[i]);
+            if (axn_cache_candidate_request(obj, req, requestSelectorsBroad[i], tick, depth, remaining)) {
+                return true;
+            }
+        }
     }
 
-    static const char *controllerSelectors[] = {
+    for (size_t i = 0; i < sizeof(requestIvarsAlways) / sizeof(requestIvarsAlways[0]); i++) {
+        if (*remaining <= 0) return *remaining < before;
+        uint64_t req = r_ivar_value(obj, requestIvarsAlways[i]);
+        if (axn_cache_candidate_request(obj, req, requestIvarsAlways[i], tick, depth, remaining)) {
+            return true;
+        }
+    }
+    if (broadScan) {
+        for (size_t i = 0; i < sizeof(requestIvarsBroad) / sizeof(requestIvarsBroad[0]); i++) {
+            if (*remaining <= 0) return *remaining < before;
+            uint64_t req = r_ivar_value(obj, requestIvarsBroad[i]);
+            if (axn_cache_candidate_request(obj, req, requestIvarsBroad[i], tick, depth, remaining)) {
+                return true;
+            }
+        }
+    }
+
+    static const char *controllerSelectorsAlways[] = {
         "notificationViewController",
         "contentViewController",
     };
-    for (size_t i = 0; i < sizeof(controllerSelectors) / sizeof(controllerSelectors[0]); i++) {
+    static const char *controllerSelectorsBroad[] = {
+        "viewController",
+        "childViewController",
+        "nextResponder",
+        "dataSource",
+        "delegate",
+        "view",
+    };
+    for (size_t i = 0; i < sizeof(controllerSelectorsAlways) / sizeof(controllerSelectorsAlways[0]); i++) {
         if (*remaining <= 0) return *remaining < before;
-        uint64_t child = axn_try_msg0_main(obj, controllerSelectors[i]);
+        uint64_t child = axn_try_msg0_main(obj, controllerSelectorsAlways[i]);
         if (!r_is_objc_ptr(child) || child == obj) continue;
         if (axn_cache_request_from_view_or_controller(child, tick, depth + 1, remaining)) {
             return true;
         }
     }
+    if (broadScan) {
+        for (size_t i = 0; i < sizeof(controllerSelectorsBroad) / sizeof(controllerSelectorsBroad[0]); i++) {
+            if (*remaining <= 0) return *remaining < before;
+            uint64_t child = axn_try_msg0_main(obj, controllerSelectorsBroad[i]);
+            if (!r_is_objc_ptr(child) || child == obj) continue;
+            if (axn_cache_request_from_view_or_controller(child, tick, depth + 1, remaining)) {
+                return true;
+            }
+        }
+    }
 
-    static const char *controllerIvars[] = {
+    static const char *controllerIvarsAlways[] = {
         "_contentViewController",
         "_notificationViewController",
     };
-    for (size_t i = 0; i < sizeof(controllerIvars) / sizeof(controllerIvars[0]); i++) {
+    static const char *controllerIvarsBroad[] = {
+        "_viewController",
+        "_childViewController",
+        "_dataSource",
+        "_delegate",
+        "_view",
+    };
+    for (size_t i = 0; i < sizeof(controllerIvarsAlways) / sizeof(controllerIvarsAlways[0]); i++) {
         if (*remaining <= 0) return *remaining < before;
-        uint64_t child = r_ivar_value(obj, controllerIvars[i]);
+        uint64_t child = r_ivar_value(obj, controllerIvarsAlways[i]);
         if (!r_is_objc_ptr(child) || child == obj) continue;
         if (axn_cache_request_from_view_or_controller(child, tick, depth + 1, remaining)) {
             return true;
+        }
+    }
+    if (broadScan) {
+        for (size_t i = 0; i < sizeof(controllerIvarsBroad) / sizeof(controllerIvarsBroad[0]); i++) {
+            if (*remaining <= 0) return *remaining < before;
+            uint64_t child = r_ivar_value(obj, controllerIvarsBroad[i]);
+            if (!r_is_objc_ptr(child) || child == obj) continue;
+            if (axn_cache_request_from_view_or_controller(child, tick, depth + 1, remaining)) {
+                return true;
+            }
         }
     }
 
@@ -1693,6 +1852,158 @@ static bool axn_cache_notification_list_view(uint64_t view, uint64_t tick, int d
     return *remaining < before;
 }
 
+static bool axn_cache_view_tree(uint64_t view, uint64_t tick, int depth,
+                                int *remaining, int *nodeBudget)
+{
+    if (!r_is_objc_ptr(view) || !remaining || !nodeBudget ||
+        *remaining <= 0 || *nodeBudget <= 0 ||
+        depth > kAxonFallbackViewDepthLimit ||
+        axn_view_is_axon_overlay(view)) {
+        return false;
+    }
+    (*nodeBudget)--;
+
+    int before = *remaining;
+    uint64_t subviews = axn_try_msg0_main(view, "subviews");
+    uint64_t subviewCount = r_is_objc_ptr(subviews) ?
+        axn_msg0_main_cached(subviews, AXNSelCount, "count") : 0;
+    if (subviewCount > kAxonFallbackSubviewLimit) subviewCount = kAxonFallbackSubviewLimit;
+
+    char cls[128] = "?";
+    bool haveClass = axn_object_class_name(view, cls, sizeof(cls));
+    bool interesting = haveClass && axn_class_interesting_for_request_owner(cls);
+    if (gAxonFallbackViewLogBudget > 0 && (depth <= 2 || interesting)) {
+        printf("[AXONLITE] fallback view depth=%d view=0x%llx class=%s subviews=%llu\n",
+               depth,
+               (unsigned long long)view,
+               haveClass ? cls : "?",
+               (unsigned long long)subviewCount);
+        gAxonFallbackViewLogBudget--;
+    }
+
+    (void)axn_cache_request_from_view_or_controller(view, tick, depth, remaining);
+    if (*remaining <= 0) return true;
+
+    static const char *viewCollections[] = {
+        "visibleViews",
+        "visibleCells",
+        "visibleSupplementaryViews",
+        "arrangedSubviews",
+    };
+    for (size_t i = 0; i < sizeof(viewCollections) / sizeof(viewCollections[0]); i++) {
+        if (*remaining <= 0 || *nodeBudget <= 0) break;
+        uint64_t related = axn_try_msg0_main(view, viewCollections[i]);
+        if (!r_is_objc_ptr(related) || related == view) continue;
+        axn_cache_collection(related, tick, depth + 1, remaining);
+    }
+
+    static const char *childViews[] = {
+        "contentView",
+        "backgroundView",
+        "selectedBackgroundView",
+        "_contentView",
+        "_lookView",
+        "_notificationContentView",
+        "_platterView",
+        "_mainOverlayView",
+        "_scrollView",
+        "_collectionView",
+        "_tableView",
+    };
+    for (size_t i = 0; i < sizeof(childViews) / sizeof(childViews[0]); i++) {
+        if (*remaining <= 0 || *nodeBudget <= 0) break;
+        uint64_t child = childViews[i][0] == '_' ?
+            r_ivar_value(view, childViews[i]) :
+            axn_try_msg0_main(view, childViews[i]);
+        if (!r_is_objc_ptr(child) || child == view) continue;
+        (void)axn_cache_view_tree(child, tick, depth + 1, remaining, nodeBudget);
+    }
+
+    if (r_is_objc_ptr(subviews) && subviews != view) {
+        for (uint64_t i = 0; i < subviewCount && *remaining > 0 && *nodeBudget > 0; i++) {
+            uint64_t child = axn_msg1_main_cached(subviews, AXNSelObjectAtIndex,
+                                                  "objectAtIndex:", i);
+            if (!r_is_objc_ptr(child) || child == view) continue;
+            (void)axn_cache_view_tree(child, tick, depth + 1, remaining, nodeBudget);
+        }
+    }
+
+    return *remaining < before;
+}
+
+static bool axn_cache_fallback_root(uint64_t root, const char *label,
+                                    uint64_t tick, int *remaining,
+                                    int *nodeBudget)
+{
+    if (!r_is_objc_ptr(root) || !remaining || !nodeBudget ||
+        *remaining <= 0 || *nodeBudget <= 0) {
+        return false;
+    }
+
+    int before = *remaining;
+    if (gAxonFallbackRootLogBudget > 0) {
+        char cls[128];
+        if (!axn_object_class_name(root, cls, sizeof(cls))) snprintf(cls, sizeof(cls), "?");
+        printf("[AXONLITE] fallback root %s=0x%llx class=%s\n",
+               label ? label : "root",
+               (unsigned long long)root,
+               cls);
+        gAxonFallbackRootLogBudget--;
+    }
+
+    if (!axn_view_is_axon_overlay(root)) {
+        (void)axn_cache_collection(root, tick, 0, remaining);
+    }
+
+    uint64_t view = 0;
+    if (r_responds_main(root, "subviews")) {
+        view = root;
+    } else if (r_responds_main(root, "view")) {
+        view = axn_try_msg0_main(root, "view");
+    }
+    if (r_is_objc_ptr(view) && !axn_view_is_axon_overlay(view)) {
+        (void)axn_cache_view_tree(view, tick, 0, remaining, nodeBudget);
+    }
+
+    return *remaining < before;
+}
+
+static bool axn_cache_view_fallback_roots(uint64_t clvc, uint64_t tick, int *remaining)
+{
+    if (!r_is_objc_ptr(clvc) || !remaining || *remaining <= 0) return false;
+
+    int before = *remaining;
+    int nodeBudget = kAxonFallbackNodeLimit;
+
+    (void)axn_cache_fallback_root(clvc, "clvc", tick, remaining, &nodeBudget);
+    if (r_is_objc_ptr(gAxonCombined) && *remaining > 0 && nodeBudget > 0) {
+        (void)axn_cache_fallback_root(gAxonCombined, "combined", tick, remaining, &nodeBudget);
+    }
+
+    uint64_t clvcView = axn_try_msg0_main(clvc, "view");
+    if (r_is_objc_ptr(clvcView) && *remaining > 0 && nodeBudget > 0) {
+        (void)axn_cache_fallback_root(clvcView, "clvc.view", tick, remaining, &nodeBudget);
+    }
+
+    uint64_t combinedView = r_is_objc_ptr(gAxonCombined) ?
+        axn_try_msg0_main(gAxonCombined, "view") : 0;
+    if (r_is_objc_ptr(combinedView) && *remaining > 0 && nodeBudget > 0) {
+        (void)axn_cache_fallback_root(combinedView, "combined.view", tick, remaining, &nodeBudget);
+    }
+
+    uint64_t coverRoot = r_is_objc_ptr(gAxonCoverSheetWindow) ?
+        axn_try_msg0_main(gAxonCoverSheetWindow, "rootViewController") : 0;
+    uint64_t coverView = r_is_objc_ptr(coverRoot) ? axn_try_msg0_main(coverRoot, "view") : 0;
+    if (r_is_objc_ptr(coverView) && *remaining > 0 && nodeBudget > 0) {
+        (void)axn_cache_fallback_root(coverView, "coverRoot.view", tick, remaining, &nodeBudget);
+    }
+
+    if ((tick <= 3 || (tick % 10) == 0) && *remaining == before) {
+        printf("[AXONLITE] fallback scan found no requests nodesLeft=%d\n", nodeBudget);
+    }
+    return *remaining < before;
+}
+
 static void axn_cache_collection(uint64_t collection, uint64_t tick, int depth, int *remaining)
 {
     if (!r_is_objc_ptr(collection) || !remaining || *remaining <= 0 ||
@@ -1830,19 +2141,31 @@ static void axn_cache_visible_requests(uint64_t clvc, uint64_t tick)
     int before = gAxonRequestCount;
     int remaining = kAxonMaxRequests;
     bool fastPath = axn_cache_list_cache_requests(requests, tick, 0, &remaining);
+    bool fallbackPath = false;
     if (!fastPath) {
         if (tick <= 3 || (tick % 10) == 0) {
             gAxonShapeLogBudget = 24;
             axn_log_object_shape("requests", requests);
         }
         axn_cache_collection(requests, tick, 0, &remaining);
+
+        // iOS 17.5.x can expose NCNotificationStructuredListViewController
+        // with remove/filter methods but no allNotificationRequests/listModel
+        // accessors. In that shape the only live request owners are cells and
+        // child view controllers, so fall back to a bounded visible-tree walk.
+        bool shouldFallbackScan = tick <= 3 ||
+                                  (tick % 10) == 0 ||
+                                  gAxonRequestCount == 0;
+        if (gAxonRequestCount == before && remaining > 0 && shouldFallbackScan) {
+            fallbackPath = axn_cache_view_fallback_roots(clvc, tick, &remaining);
+        }
     }
     int walked = kAxonMaxRequests - remaining;
     int delta = gAxonRequestCount - before;
     if (tick <= 2 || delta != 0 || (tick % 60) == 0) {
         printf("[AXONLITE] cache tick=%llu source=%s walked=%d cached=%d new=%d\n",
                (unsigned long long)tick,
-               fastPath ? "listCache" : "walk",
+               fastPath ? "listCache" : (fallbackPath ? "viewFallback" : "walk"),
                walked,
                gAxonRequestCount,
                delta);
@@ -2643,10 +2966,34 @@ static bool axn_badge_signature(AXNBundle *bundles, int bundleCount, char *out, 
 
 static bool axn_update_overlay(uint64_t clvc, AXNBundle *bundles, int bundleCount)
 {
+    if (bundleCount > kAxonMaxBundles) bundleCount = kAxonMaxBundles;
+
+    if (bundleCount <= 0) {
+        if (r_is_objc_ptr(gAxonControl) &&
+            gAxonDisplayedCount > 1 &&
+            gAxonSegmentSignature[0] != '\0') {
+            if (!axn_ensure_window(clvc)) return false;
+            axn_ensure_spinner();
+            if (gAxonTick <= 3 || (gAxonTick % 60) == 0) {
+                printf("[AXONLITE] preserving icon strip while visible request cache is empty displayed=%d\n",
+                       gAxonDisplayedCount - 1);
+            }
+            axn_layout_window(gAxonDisplayedCount - 1);
+            return true;
+        }
+
+        if (r_is_objc_ptr(gAxonWindow)) {
+            r_msg2_main(gAxonWindow, "setHidden:", 1, 0, 0, 0);
+        }
+        if (gAxonTick <= 3 || (gAxonTick % 60) == 0) {
+            printf("[AXONLITE] overlay idle: no notification bundles tracked yet\n");
+        }
+        return true;
+    }
+
     if (!axn_ensure_window(clvc)) return false;
     axn_ensure_spinner();
 
-    if (bundleCount > kAxonMaxBundles) bundleCount = kAxonMaxBundles;
     if (bundleCount <= 0 &&
         r_is_objc_ptr(gAxonControl) &&
         gAxonDisplayedCount > 1 &&
@@ -3012,6 +3359,101 @@ static void axn_filtered_remove(const char *bundle)
     memset(gAxonFilteredBundles[gAxonFilteredCount], 0, 128);
 }
 
+static bool axn_bundle_seen(char bundles[][128], int count, const char *bundle)
+{
+    if (!bundle || !bundle[0]) return true;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(bundles[i], bundle) == 0) return true;
+    }
+    return false;
+}
+
+static void axn_bundle_note(char bundles[][128], int *count, int maxCount, const char *bundle)
+{
+    if (!bundles || !count || *count >= maxCount || !bundle || !bundle[0]) return;
+    if (axn_bundle_seen(bundles, *count, bundle)) return;
+    snprintf(bundles[*count], 128, "%s", bundle);
+    (*count)++;
+}
+
+static bool axn_filter_section_bundle(uint64_t clvc, const char *bundle, bool shouldFilter)
+{
+    if (!r_is_objc_ptr(clvc) || !bundle || !bundle[0] || !gAxonClvcCanToggleFilter) return false;
+    uint64_t section = axn_section_id_for_bundle(bundle);
+    if (!r_is_objc_ptr(section)) return false;
+    r_msg2_main(clvc, "toggleFilteringForSectionIdentifier:shouldFilter:",
+                section, shouldFilter ? 1 : 0, 0, 0);
+    if (shouldFilter) axn_filtered_add(bundle);
+    else axn_filtered_remove(bundle);
+    return true;
+}
+
+static void axn_tick_spinner_hold(void)
+{
+    if (gAxonSpinnerHoldTicks <= 0) return;
+    gAxonSpinnerHoldTicks--;
+    if (gAxonSpinnerHoldTicks == 0) axn_show_spinner(false);
+}
+
+static bool axn_apply_section_filter(uint64_t clvc, uint64_t tick)
+{
+    if (!r_is_objc_ptr(clvc) || !gAxonClvcCanToggleFilter) return false;
+
+    bool filterEnabled = gAxonSelectedBundle[0] != '\0';
+    bool selectionChanged = strcmp(gAxonSelectedBundle, gAxonLastAppliedFilter) != 0;
+    if (selectionChanged) {
+        axn_show_spinner(true);
+        gAxonSpinnerHoldTicks = 2;
+    }
+    if (!filterEnabled && !selectionChanged && gAxonFilteredCount == 0) {
+        axn_tick_spinner_hold();
+        return true;
+    }
+
+    char bundles[kAxonMaxRequests][128];
+    int bundleCount = 0;
+    memset(bundles, 0, sizeof(bundles));
+
+    for (int i = 0; i < gAxonRequestCount; i++) {
+        axn_bundle_note(bundles, &bundleCount, kAxonMaxRequests, gAxonRequests[i].bundle);
+    }
+    for (int i = 0; i < gAxonBundleRosterCount; i++) {
+        axn_bundle_note(bundles, &bundleCount, kAxonMaxRequests, gAxonBundleRoster[i].bundle);
+    }
+    for (int i = 0; i < gAxonFilteredCount; i++) {
+        axn_bundle_note(bundles, &bundleCount, kAxonMaxRequests, gAxonFilteredBundles[i]);
+    }
+
+    int filtered = 0;
+    int unfiltered = 0;
+    for (int i = 0; i < bundleCount; i++) {
+        bool shouldFilter = filterEnabled && strcmp(bundles[i], gAxonSelectedBundle) != 0;
+        bool alreadyFiltered = axn_filtered_index(bundles[i]) >= 0;
+        if (shouldFilter == alreadyFiltered) continue;
+        if (axn_filter_section_bundle(clvc, bundles[i], shouldFilter)) {
+            if (shouldFilter) filtered++;
+            else unfiltered++;
+        }
+    }
+
+    if (selectionChanged) {
+        snprintf(gAxonLastAppliedFilter, sizeof(gAxonLastAppliedFilter), "%s", gAxonSelectedBundle);
+    }
+
+    if (selectionChanged || filtered || unfiltered) {
+        printf("[AXONLITE] section filter tick=%llu selected=%s filtered=%d unfiltered=%d known=%d tracked=%d\n",
+               (unsigned long long)tick,
+               gAxonSelectedBundle[0] ? gAxonSelectedBundle : "All",
+               filtered,
+               unfiltered,
+               bundleCount,
+               gAxonRequestCount);
+        gAxonFilterLoggedOnce = true;
+    }
+    axn_tick_spinner_hold();
+    return true;
+}
+
 // Drive section-level filtering via
 // toggleFilteringForSectionIdentifier:shouldFilter:. This is the only
 // reversible primitive stock SB exposes on
@@ -3031,6 +3473,10 @@ static void axn_filtered_remove(const char *bundle)
 static void axn_apply_filter(uint64_t clvc, uint64_t tick)
 {
     if (!r_is_objc_ptr(clvc)) return;
+    if (gAxonClvcCanToggleFilter) {
+        (void)axn_apply_section_filter(clvc, tick);
+        return;
+    }
     if (!gAxonClvcCanRemove) return;
 
     uint32_t axonOldSettle = r_settle_us(1000);
@@ -3119,10 +3565,7 @@ static void axn_apply_filter(uint64_t clvc, uint64_t tick)
         gAxonFilterLoggedOnce = true;
     }
 
-    if (gAxonSpinnerHoldTicks > 0) {
-        gAxonSpinnerHoldTicks--;
-        if (gAxonSpinnerHoldTicks == 0) axn_show_spinner(false);
-    }
+    axn_tick_spinner_hold();
 
     // Visual ground-truth probe: after the filter pass, read back what SB
     // actually has in its visible-cell cache and the segmented control's
