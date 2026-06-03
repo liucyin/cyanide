@@ -574,9 +574,11 @@ static bool axn_vc_looks_like_notification_list(uint64_t vc)
     }
 
     // iOS 17.5.x on some devices materializes the controller without exposing
-    // -allNotificationRequests. The request source then lives behind listModel,
-    // while the controller still has the NCNotification class shape.
-    return classLooks && (listModel || (listView && mutatesRequests));
+    // -allNotificationRequests/listModel/listView until the notification center
+    // is actually visible. A NCNotification* controller that can remove/filter
+    // requests is still the CLVC we need; later cache passes can harvest cells
+    // once SpringBoard populates the model or visible views.
+    return classLooks && (listModel || mutatesRequests || listView);
 }
 
 static uint64_t axn_accept_list_controller(uint64_t vc, const char *via)
